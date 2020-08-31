@@ -1,0 +1,7 @@
+.clean-rebuild-fordistribution.sh
+stackeventlog.json
+APIEndpoint
+clientexample/APIEndpoint
+xraylayer/layer/python/*
+collectdatafunc/layer/python/*
+*__pycache__*

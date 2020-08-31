@@ -1,0 +1,900 @@
+AWSTemplateFormatVersion: 2010-09-09 #Currently only valid value 
+Description: Stack for OptionsHistory collection and Simple API
+ 
+Parameters: 
+  # Lambda Proxy Parameters
+  lambdaproxyfuncname:
+    Type: String
+  lambdaproxyfuncs3key:
+    Type: String
+  
+  # Collect Data Function parameters
+  collectdatafuncname:
+    Type: String
+  collectdatafuncs3key:
+    Type: String  
+  
+  # Log Processing Function parameters
+  logprocessingfuncname:
+    Type: String
+  logprocessingfuncs3key:
+    Type: String
+
+  # Stream Processing Function parameters
+  streamprocessingfuncname:
+    Type: String
+  streamprocessingfuncs3key:
+    Type: String
+  
+  # Collect Data Layer parameters
+  collectdatalayers3key:
+    Type: String
+
+  # S3bucket for all the packed lambda code
+  s3bucket:
+    Type: String
+  
+  # Python3.7 aws_xray_sdk layer s3 Key
+  pythonxraysdklayers3key:
+    Type: String
+
+  # Cron Schedule for collection
+  cronschedule:
+    Type: String
+    Default: ""
+  
+  # If none empty string then Active X-Ray on Lambda Functions and
+  #  add the aws_xray_sdk layer to the lambda functions 
+  activatexray:
+    Type: String
+    Default: ""
+
+  # If set to none empty string then A dashboard with custom cloud metrics
+  #  is buildt
+  builddashboard:
+    Type: String
+    Default: ""
+ 
+  # Subscriber to the SNS topic
+  logprocessingsnssubscriber:
+    Type: String
+    Default: ""
+
+Conditions:
+  PublishErrorsSNSCondition: !Not [ !Equals [!Ref logprocessingsnssubscriber, "" ] ]
+  ActivateXRayCondition: !Not [ !Equals [ !Ref activatexray, "" ] ]
+  BuildDashBoardCondition: !Not [ !Equals [ !Ref builddashboard, "" ] ] 
+  CronScheduledCollectionCondition: !Not [ !Equals [ !Ref cronschedule, "" ] ]
+
+Outputs:
+  ApiEndpoint:
+    Description: >
+      Used to output the API endpoint to the local directory
+      REMINDER: https://gynico83y1.execute-api.us-east-2.amazonaws.com
+      is always how Api Gateway Generates the endpoints the first sub
+      domain is the API logical id and notice the region in there
+
+    Value: !Sub
+      - "https://${APIID}.execute-api.${REGION}.amazonaws.com"
+      - APIID: !Ref HttpPassThroughApi
+        REGION: !Ref "AWS::Region"
+
+Resources: 
+  #####################################################################
+  # Common Role used for all Lambda functions in the stack
+  #  Inline Policy and limit Assume Role to the three lambda functions
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    Properties:
+      # Policy once role is assumed is added through LambdaPolicy
+      Description: "Common role for Lambda Functions in OptionsHistory Stack"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: OptionsHistory-LambdaRolePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:AttachNetworkInterface
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents           
+                  - logs:GetLogEvents
+                  - logs:DescribeLogStreams
+                  - lambda:InvokeFunction
+                  - xray:PutTraceSegments
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt OptionsHistTable.Arn
+                  - !GetAtt TickersToCollectTable.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource:
+                  - !GetAtt OptionsHistTable.StreamArn
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt TickersToCollectTable.Arn
+              - !If
+                - PublishErrorsSNSCondition
+                - Effect: Allow
+                  Action:
+                    - sns:Publish
+                  Resource: !Ref LogProcessingSNSTopic
+                - !Ref "AWS::NoValue"
+
+  #####################################################################
+  # Resources for the quick create HTTP API with Lambda Proxy for 
+  #  getting the data out of AWS 
+  LambdaProxyFunction:
+    Type: AWS::Lambda::Function
+    DeletionPolicy: Delete
+    Properties: 
+      Code:
+        S3Bucket: !Ref s3bucket
+        S3Key: !Ref lambdaproxyfuncs3key
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.7
+      FunctionName: !Ref lambdaproxyfuncname
+      Environment:
+        Variables:
+          XRAYACTIVATED: !If
+            - ActivateXRayCondition
+            - "TRUE"
+            - !Ref AWS::NoValue
+      Layers: 
+        - !Ref CollectDataLayer
+        - !If
+          - ActivateXRayCondition
+          - !Ref XRaySdkLayer
+          - !Ref AWS::NoValue
+      TracingConfig:
+        Mode: !If
+          - ActivateXRayCondition
+          - Active
+          - !Ref AWS::NoValue
+      MemorySize: 192
+      Timeout: 10
+
+  LambdaProxyFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Join [ "", [ /aws/lambda/ , !Ref LambdaProxyFunction ] ]
+      RetentionInDays: 7
+
+ # API Gateway HTTP Lambda proxy passthrough
+  HttpPassThroughApi:
+    Type: AWS::ApiGatewayV2::Api
+    DeletionPolicy: Delete
+    Properties:
+      Name: Options-History
+      Description: Lambda proxy using quick create
+      ProtocolType: HTTP
+      Target: !GetAtt LambdaProxyFunction.Arn
+
+  # Permission that allows API Gateway Services to invoke the Lambda
+  #  proxy function
+  ApiLambaPermissions:
+    Type: AWS::Lambda::Permission
+    DeletionPolicy: Delete
+    Properties:
+      FunctionName: !GetAtt LambdaProxyFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: 'apigateway.amazonaws.com'
+
+  #####################################################################
+  # Log Processing and SNS publishing of error statistics
+  #  function that is used to process logs after each collection run
+  #  Publishes to an SNS Topic if a web scrapping error show an
+  #  unusual number of failures. Or if expiration dates can't be
+  #  found for a given ticker
+
+  LogProcessingFunction:
+    Type: AWS::Lambda::Function
+    DeletionPolicy: Delete
+    Properties:
+      Code:
+        S3Bucket: !Ref s3bucket
+        S3Key: !Ref logprocessingfuncs3key
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.7
+      FunctionName: !Ref logprocessingfuncname
+      Layers:
+        - !If 
+          - ActivateXRayCondition
+          - !Ref XRaySdkLayer
+          - !Ref AWS::NoValue
+      Environment:
+        Variables:
+          SNSTOPICARN: !If 
+            - PublishErrorsSNSCondition
+            - !Ref LogProcessingSNSTopic 
+            - !Ref AWS::NoValue
+          XRAYACTIVATED: !If
+            - ActivateXRayCondition
+            - "TRUE"
+            - !Ref AWS::NoValue
+          COLLECTIONLOGGROUP: !Ref CollectDataFunctionLogs
+
+      TracingConfig:
+        Mode: !If
+          - ActivateXRayCondition
+          - Active
+          - !Ref AWS::NoValue
+      MemorySize: 128
+      Timeout: 150
+
+  LogProcessingFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Join [ "", [ /aws/lambda/ , !Ref LogProcessingFunction ] ]
+      RetentionInDays: 7
+
+  # Setting up invocation permission for the collectdatafunction to 
+  # launch the log processing function
+  LogProcessingPermission:      
+    Type: AWS::Lambda::Permission
+    DeletionPolicy: Delete
+    Properties:
+      FunctionName: !GetAtt LogProcessingFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: 'lambda.amazonaws.com'
+      SourceArn: !GetAtt CollectDataFunction.Arn
+
+  # SNS topic for publishing error reports
+  LogProcessingSNSTopic:
+    Type: AWS::SNS::Topic 
+    DeletionPolicy: Delete
+    Condition: PublishErrorsSNSCondition
+    Properties:
+      DisplayName: AwsOptionsHistory
+      Subscription:
+        - Endpoint: !Ref logprocessingsnssubscriber
+          Protocol: email
+      TopicName: ScrapingErrorNotification
+
+  ######################################################################
+  # Collect Data Lambda Function Resources
+  # Function that runs the parser for Data collection function
+  CollectDataFunction:
+    Type: AWS::Lambda::Function
+    DeletionPolicy: Delete
+    Properties: 
+      Code:
+        S3Bucket: !Ref s3bucket
+        S3Key: !Ref collectdatafuncs3key
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.7
+      FunctionName: !Ref collectdatafuncname
+      Environment:
+        Variables:
+          XRAYACTIVATED: !If
+            - ActivateXRayCondition
+            - "TRUE"
+            - !Ref AWS::NoValue
+          MANYSTAGENUM: 32
+          EXTRAQUEUESIZE: 20
+      Layers: 
+        - !Ref CollectDataLayer
+        - !If 
+          - ActivateXRayCondition
+          - !Ref XRaySdkLayer
+          - !Ref AWS::NoValue
+      TracingConfig: 
+        Mode: !If
+          - ActivateXRayCondition
+          - Active
+          - !Ref AWS::NoValue
+      MemorySize: 448
+      Timeout: 300
+  
+  CollectDataFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Join [ "", [ /aws/lambda/ , !Ref CollectDataFunction ] ]
+      RetentionInDays: 7
+
+  CollectDataRecursivePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CollectDataFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: 'lambda.amazonaws.com'
+      SourceArn: !GetAtt CollectDataFunction.Arn
+
+  CollectDataLambdaProxyPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CollectDataFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: 'lambda.amazonaws.com'
+      SourceArn: !GetAtt CollectDataFunction.Arn
+
+  CollectDataEventPermission:      
+    Type: AWS::Lambda::Permission
+    Condition: CronScheduledCollectionCondition
+    Properties:
+      FunctionName: !GetAtt CollectDataFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt CollectDataEvent.Arn
+
+  CollectDataEvent:
+    Type: AWS::Events::Rule
+    DeletionPolicy: Delete
+    Condition: CronScheduledCollectionCondition
+    Properties:  
+      Description: Initialize the Data Collection Process
+      # The schedule for when data is collected REMINDER UTC Time
+      ScheduleExpression: !Ref cronschedule   
+      Name: CollectOptionsHistory
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CollectDataFunction.Arn
+          Id: Initialize-DataCollection
+          Input: '{"State": "initialize"}'
+
+  CollectDataLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes: ['python3.7']
+      Content:
+        S3Bucket: !Ref s3bucket
+        S3Key: !Ref collectdatalayers3key
+      Description: aiohttp,pandas,lxml,numpy,bs4 (full not cleaned)
+
+  ######################################################################
+  # Lambda Function and Event Source Mapping for DynamoDB Streams
+  # Function is responsible for keeping metadata in OptionsHistTickers,
+  # about the data in OptionsHist Table 
+  DBStreamProcessingFunction:
+    Type: AWS::Lambda::Function
+    DeletionPolicy: Delete
+    Properties: 
+      Code:
+        S3Bucket: !Ref s3bucket
+        S3Key: !Ref streamprocessingfuncs3key
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.7
+      FunctionName: !Ref streamprocessingfuncname
+      Environment:
+        Variables:
+          XRAYACTIVATED: !If
+            - ActivateXRayCondition
+            - "TRUE"
+            - !Ref AWS::NoValue
+      Layers:
+        - !If 
+          - ActivateXRayCondition
+          - !Ref XRaySdkLayer
+          - !Ref AWS::NoValue      
+      TracingConfig: 
+        Mode: !If
+          - ActivateXRayCondition
+          - Active
+          - !Ref AWS::NoValue
+      MemorySize: 128
+      Timeout: 300
+
+  DBStreamProcessingFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Join [ "", [ /aws/lambda/ , !Ref DBStreamProcessingFunction ] ]
+      RetentionInDays: 7
+
+  StreamEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn: OptionsHistTable
+    Properties:
+      BatchSize: 1000
+      Enabled: true
+      EventSourceArn: !GetAtt OptionsHistTable.StreamArn
+      FunctionName: !GetAtt DBStreamProcessingFunction.Arn
+      MaximumBatchingWindowInSeconds: 30
+      MaximumRetryAttempts: 1
+      StartingPosition: LATEST
+
+  ######################################################################
+  # DynamoDB Resources
+  
+  # Global Primary Index (Collect, Ticker) If a ticker exists in this
+  #  table options data will be collected for it. At end of day cloud
+  #  watch logs are processed and statistics are collected on scraping
+  #  failures. Stat
+
+  TickersToCollectTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      TableName: OptionsHistTickers
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 2
+        WriteCapacityUnits: 2
+      AttributeDefinitions:
+        - AttributeName: Ticker
+          AttributeType: S
+        - AttributeName: Collecting
+          AttributeType: S
+      KeySchema:
+        - AttributeName: Collecting
+          KeyType: HASH
+        - AttributeName: Ticker
+          KeyType: RANGE
+      
+  # Table that holds the scraped data
+  OptionsHistTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      TableName: OptionsHist
+      BillingMode: PROVISIONED
+      # Enable DynamoDB Stream with KEYS_ONLY specification
+      StreamSpecification:
+        StreamViewType: KEYS_ONLY
+      #Set provisioning below the free tier limits
+      ProvisionedThroughput:
+        ReadCapacityUnits: 8
+        WriteCapacityUnits: 8
+      #Define Attributes that will be used as the Index keys
+      AttributeDefinitions:
+        - AttributeName: Ticker
+          AttributeType: S
+        - AttributeName: TimeCollectedExpirationDate
+          AttributeType: 'N'
+      #Define the GlobalPrimaryKey Schema
+      KeySchema:
+        - AttributeName: Ticker
+          KeyType: HASH
+        - AttributeName: TimeCollectedExpirationDate
+          KeyType: RANGE
+
+  ######################################################################
+  # Xray Ray Layer for Activating X-Ray. Provides python3.7 aws_xray_sdk
+  # i.e. pip install aws_xray_sdk
+  XRaySdkLayer:
+    Type: AWS::Lambda::LayerVersion
+    DeletionPolicy: Delete
+    Condition: ActivateXRayCondition
+    Properties:
+      CompatibleRuntimes: ['python3.7']
+      Content:
+        S3Bucket: !Ref s3bucket
+        S3Key: !Ref pythonxraysdklayers3key
+      Description: "aws_xray_sdk"
+
+  ######################################################################
+  # CloudWatch DashBoard for monitoring lambda utilization with custom
+  #  metrics for two main scraping errors "NO EXPIRATION DATES" and 
+  #  "CALLS BUT NO PUTS"
+  OptionsHistoryDashBoard:
+      Type: AWS::CloudWatch::Dashboard
+      Condition: BuildDashBoardCondition
+      Properties:
+        DashboardName: "OptionsHistory-Monitoring"
+        DashboardBody: !Sub 
+          - >
+            { "widgets" : 
+              [
+                
+                {
+                  "type": "text",
+                  "x": 0,
+                  "y": 0,
+                  "width": 11,
+                  "height": 2,
+                  "properties":
+                    {
+                      "markdown": "# OptionsHistory Serverless Stack Monitoring "
+                    } 
+                },
+
+                {
+                  "type": "metric",
+                  "x": 11,
+                  "y": 0,
+                  "width": 5,
+                  "height": 2,
+                  "properties":
+                    {
+                      "region": "${__regionplaceholder}",
+                      "stat": "Sum",
+                      "title": "Data Collection Invocations",
+                      "view": "singleValue",
+                      "metrics": [
+                          [
+                            "AWS/Lambda", 
+                            "Invocations", 
+                            "FunctionName", 
+                            "${__collectionfunctionameplaceholder}"
+                          ]
+                        ]
+                    }
+                },
+
+                {
+                  "type": "metric",
+                  "x": 16,
+                  "y": 0,
+                  "width": 5,
+                  "height": 2,
+                  "properties":
+                    {
+                      "region": "${__regionplaceholder}",
+                      "stat": "Sum",
+                      "title": "API Requests",
+                      "view": "singleValue",
+                      "metrics" : [
+                        [
+                          "AWS/Lambda",
+                          "Invocations",
+                          "FunctionName",
+                          "${__lambdaproxyfunctionnameplaceholder}"
+                        ]
+                      ]
+                    }
+                },
+
+                {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 2,
+                  "width": 5,
+                  "height": 2,
+                  "properties":
+                    {
+                      "region": "${__regionplaceholder}",
+                      "stat": "Sum",
+                      "title": "Lambda Proxy Function Errors",
+                      "view": "singleValue",
+                      "metrics" : [
+                        [
+                          "AWS/Lambda",
+                          "Errors",
+                          "FunctionName",
+                          "${__lambdaproxyfunctionnameplaceholder}"
+                        ]
+                      ]
+                    }
+                },
+
+                {
+                  "type": "metric",
+                  "x": 5,
+                  "y": 2,
+                  "width": 5,
+                  "height": 2,
+                  "properties":
+                    {
+                      "region": "${__regionplaceholder}",
+                      "stat": "Sum",
+                      "title": "Data Collection Function Errors",
+                      "view": "singleValue",
+                      "metrics" : [
+                        [
+                          "AWS/Lambda",
+                          "Errors",
+                          "FunctionName",
+                          "${__collectionfunctionameplaceholder}"
+                        ]
+                      ]
+                    }
+                },
+                
+                {
+                  "type": "metric",
+                  "x": 10,
+                  "y": 2,
+                  "width": 5,
+                  "height": 2,
+                  "properties":
+                    {
+                      "region": "${__regionplaceholder}",
+                      "stat": "Sum",
+                      "title": "Log Processing Function Errors",
+                      "view": "singleValue",
+                      "metrics" : [
+                        [
+                          "AWS/Lambda",
+                          "Errors",
+                          "FunctionName",
+                          "${__logprocessingfunctionnameplaceholder}"
+                        ]
+                      ]
+                    }
+                },
+
+                {
+                  "type": "metric",
+                  "x": 15,
+                  "y": 2,
+                  "width": 5,
+                  "height": 2,
+                  "properties":
+                    {
+                      "region": "${__regionplaceholder}",
+                      "stat": "Sum",
+                      "title": "DBStream Processing Function Errors",
+                      "view": "singleValue",
+                      "metrics" : [
+                        [
+                          "AWS/Lambda",
+                          "Errors",
+                          "FunctionName",
+                          "${__streamprocessingfunctionnameplaceholder}"
+                        ]
+                      ]
+                    }
+                },
+
+                {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 4,
+                  "width": 12,
+                  "height": 8,
+                  "properties":
+                    {
+                      "region": "${__regionplaceholder}",
+                      "stat": "Average",
+                      "title": "OptionsHist Capacity Units",
+                      "view": "timeSeries",
+                      "metrics": [
+                        [
+                          "AWS/DynamoDB",
+                          "ConsumedWriteCapacityUnits",
+                          "TableName",
+                          "OptionsHist"
+                        ],
+                        [
+                          "AWS/DynamoDB",
+                          "ProvisionedWriteCapacityUnits",
+                          "TableName",
+                          "OptionsHist"
+                        ],
+                        [
+                          "AWS/DynamoDB",
+                          "ConsumedReadCapacityUnits",
+                          "TableName",
+                          "OptionsHist"
+                        ],
+                        [
+                          "AWS/DynamoDB",
+                          "ProvisionedReadCapacityUnits",
+                          "TableName",
+                          "OptionsHist"
+                        ]
+                      ]
+                    }
+                },
+
+                {
+                  "type": "metric",
+                  "x": 12,
+                  "y": 4,
+                  "width": 12,
+                  "height": 8,
+                  "properties":
+                    {
+                      "region": "${__regionplaceholder}",
+                      "stat": "Average",
+                      "title": "OptionsHistTickers Capacity Units",
+                      "view": "timeSeries",
+                      "metrics": [
+                        [
+                          "AWS/DynamoDB",
+                          "ConsumedWriteCapacityUnits",
+                          "TableName",
+                          "OptionsHistTickers"
+                        ],
+                        [
+                          "AWS/DynamoDB",
+                          "ProvisionedWriteCapacityUnits",
+                          "TableName",
+                          "OptionsHistTickers"
+                        ],
+                        [
+                          "AWS/DynamoDB",
+                          "ConsumedReadCapacityUnits",
+                          "TableName",
+                          "OptionsHistTickers"
+                        ],
+                        [
+                          "AWS/DynamoDB",
+                          "ProvisionedReadCapacityUnits",
+                          "TableName",
+                          "OptionsHistTickers"
+                        ]
+                      ]
+                    }
+                },
+                {
+                  "type": "log",
+                  "x": 0,
+                  "y": 12,
+                  "width": 5,
+                  "height": 4,
+                  "properties":
+                    {
+                      "region": "${__regionplaceholder}",
+                      "title": "Lambda Proxy Memory Usage",
+                      "view": "bar",
+                      "query": "SOURCE '${__lambdaproxyfunctionlogplaceholder}' | fields @message | parse '* *' as logtype, logmessage | filter logtype = 'REPORT' | stats max(@maxMemoryUsed), max(@memorySize) by @memorySize"
+                     
+                    }
+                },
+                {
+                  "type": "log",
+                  "x": 5,
+                  "y": 12,
+                  "width": 5,
+                  "height": 4,
+                  "properties":
+                    {
+                      "region": "${__regionplaceholder}",
+                      "title": "Collect Data Memory Usage",
+                      "view": "bar",
+                      "query": "SOURCE '${__collectdatafunctionlogplaceholder}' | fields @message | parse '* *' as logtype, logmessage | filter logtype = 'REPORT' | stats max(@maxMemoryUsed), max(@memorySize) by @memorySize"
+                     
+                    }
+                },
+                {
+                  "type": "log",
+                  "x": 10,
+                  "y": 12,
+                  "width": 5,
+                  "height": 4,
+                  "properties":
+                    {
+                      "region": "${__regionplaceholder}",
+                      "title": "Log Processing Memory Usage",
+                      "view": "bar",
+                      "query": "SOURCE '${__logprocessingfunctionlogplaceholder}' | fields @message | parse '* *' as logtype, logmessage | filter logtype = 'REPORT' | stats max(@maxMemoryUsed), max(@memorySize) by @memorySize"
+          
+                    }
+                },
+                {
+                  "type": "log",
+                  "x": 15,
+                  "y": 12,
+                  "width": 5,
+                  "height": 4,
+                  "properties":
+                    {
+                      "region": "${__regionplaceholder}",
+                      "title": "Stream Memory Usage",
+                      "view": "bar",
+                      "query": "SOURCE '${__streamprocessingfunctionlogplaceholder}' | fields @message | parse '* *' as logtype, logmessage | filter logtype = 'REPORT' | stats max(@maxMemoryUsed), max(@memorySize) by @memorySize"
+                     
+                    }
+                },
+
+                {
+                  "type": "log",
+                  "x": 0,
+                  "y": 16,
+                  "width": 5,
+                  "height": 4,
+                  "properties":
+                    {
+                      "region": "${__regionplaceholder}",
+                      "title": "Lambda Proxy Function Request Counts",
+                      "view": "bar",
+                      "query": "SOURCE '${__lambdaproxyfunctionlogplaceholder}' | fields @message | parse '* [*] *' as logtype, requesttype, remainder | filter logtype = 'REQUEST' | stats count(*) by requesttype"
+                    }
+                },
+
+                {
+                  "type": "metric",
+                  "x": 5,
+                  "y": 16,
+                  "width": 5,
+                  "height": 4,
+                  "properties":
+                    {
+                      "region": "${__regionplaceholder}",
+                      "title": "Data Collection Function Duration",
+                      "view": "bar",
+                      "metrics" : [
+                        [
+                          "AWS/Lambda",
+                          "Duration",
+                          "FunctionName",
+                          "${__collectionfunctionameplaceholder}"
+                        ]
+                      ]
+                    }
+                },
+                
+                {
+                  "type": "metric",
+                  "x": 10,
+                  "y": 16,
+                  "width": 5,
+                  "height": 4,
+                  "properties":
+                    {
+                      "region": "${__regionplaceholder}",
+                      "title": "Log Processing Duration",
+                      "view": "bar",
+                      "metrics" : [
+                        [
+                          "AWS/Lambda",
+                          "Duration",
+                          "FunctionName",
+                          "${__logprocessingfunctionnameplaceholder}"
+                        ]
+                      ]
+                    }
+                },
+
+                {
+                  "type": "metric",
+                  "x": 15,
+                  "y": 16,
+                  "width": 5,
+                  "height": 4,
+                  "properties":
+                    {
+                      "region": "${__regionplaceholder}",
+                      "title": "DBStream Processing Duration",
+                      "view": "bar",
+                      "metrics" : [
+                        [
+                          "AWS/Lambda",
+                          "Duration",
+                          "FunctionName",
+                          "${__streamprocessingfunctionnameplaceholder}"
+                        ]
+                      ]
+                    }
+                }
+              ]
+            }
+          - __regionplaceholder: !Ref "AWS::Region"
+            
+            __collectionfunctionameplaceholder: !Ref collectdatafuncname
+            __lambdaproxyfunctionnameplaceholder: !Ref lambdaproxyfuncname
+            __logprocessingfunctionnameplaceholder: !Ref logprocessingfuncname
+            __streamprocessingfunctionnameplaceholder: !Ref streamprocessingfuncname
+            
+            __collectdatafunctionlogplaceholder: !Ref CollectDataFunctionLogs
+            __lambdaproxyfunctionlogplaceholder: !Ref LambdaProxyFunctionLogs
+            __logprocessingfunctionlogplaceholder: !Ref LogProcessingFunctionLogs
+            __streamprocessingfunctionlogplaceholder: !Ref DBStreamProcessingFunctionLogs
+            
