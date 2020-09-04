@@ -358,7 +358,7 @@ Resources:
             - "TRUE"
             - !Ref AWS::NoValue
           TICKERQUEUESIZE: 5
-          MAXCONNECTIONS: 32
+          MAXCONNECTIONS: 18
           NOTREACHABLESQS: !Ref NotReachableQueue
           LOGLEVEL: !Ref loglevellambdafunctions
       Layers: 

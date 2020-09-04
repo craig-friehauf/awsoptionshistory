@@ -3,11 +3,11 @@
 
 # See REAMME.md of information how these varaibles effect the stack
 STACKNAME='OptionsHistory'
-REGION='us-west-1'
-S3BUCKET='craigfriehauf-sanfran'
+REGION='us-east-2'
+S3BUCKET='craigfriehauf'
 SNSEMAIL='contact.craigfriehauf@gmail.com'
 #XRAY='TRUE'
-BUILDDASHBOARD='OptionsHistory-Monitoring-Test'
+BUILDDASHBOARD='OptionsHistory-Monitoring'
 LOGLEVEL='ERROR'
 # See README.md for more details on AWS formated cron schedules
 CRONSCHEDULE='cron(0 14,17,20 ? * 2-6 *)'
