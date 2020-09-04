@@ -4,8 +4,12 @@ Name: OptionsHistory-CollectDataFunc
 
 Inputs Events:
     -------------------------------------------------------------------
-    {"State": "initialize"|"continue",
-     "Tickers": [tickers to collect]}
+    {"State": "initialize"} --> Get the Collection List and start
+    {
+        "State": "continue",
+        "Tickers": ["AAPL",...]
+        "runs_timestamp": UnixTimeStamp from initial call
+    } --> continue will collection run
 
     State must be defined or function will fail
     If State is continue and Tickers doesn't exist fail
@@ -20,31 +24,28 @@ File OverView:
     -------------------------------------------------------------------
 
     Funtions that start with _ are helper functions. There are 6 main
-        functions that work together to build a 4 stage asyncio pipeline
+        functions that work together to build a 5 stage asyncio pipeline
         to collect, tranform and store options data
 
-    def handler: Function called when the lambda function is invoked
     async def async_handler: constructs all async tasks and starts the
         pipline
 
     Pipeline functions:
         Stage 1: async def ticker_handler
-            Gets expiration dates for the ticker and tee up for stage 2
-        Stage 2: async def chain_request MANYSTAGE
-            Makes http requests to get the data
-        Stage 3: async def encode_db_item
+            Fills the queue between Stage 1 and 2 then passed remaining
+            tickers to next invocation of the collection function
+        Stage 2: async def get_expiration_dates
+            Get the exipration dates for a ticker and stage the values
+            for stage 3
+        Stage 3: async def chain_request
+            Makes http requests to get the data for a (ticker, expiration)
+        Stage 4: async def encode_db_item
             Transform the data in to a JSON document for insertion in
             DynamoDB
-        Stage 4: async def put_db_item
+        Stage 5: async def put_db_item
             Makes put calls to DynamoDB to store the data
-
-Integration Reminders:
-    --------------------------------------------------------------------
-    I am using the print statement in the handle function
-    "--Init Collect Data" to let the OptionsHistory-LogProcessing
-    function know when a particular collection run started.
-    Don't change this with out changing the logprocessing function
 """
+
 
 import base64
 import boto3
@@ -55,10 +56,12 @@ import aiohttp
 import numpy as np
 import pandas as pd
 from datetime import datetime
+import time
 from boto3.dynamodb.conditions import Key
+import logging
 
 
-if not os.environ.get("XRAYACTIVATED") is None:
+if os.environ.get("XRAYACTIVATED") is not None:
     # Xray Has been activated for the stack, patch calls to AWS services
     #  with X-Ray Trace Headers and send trace segments to X-Ray deamon
     # from aws_xray_sdk.core import xray_recorder currently not using
@@ -66,16 +69,48 @@ if not os.environ.get("XRAYACTIVATED") is None:
     # Patch for X-Ray Tracing to DynamoDB and AWS API calls
     patch_all()
 
+# Initialize logging module for the lambda function
+logger = logging.getLogger()
+logger.setLevel(getattr(logging, os.environ['LOGLEVEL']))
+
 # Played around, these seem to work the best to saturate the Lambda's
 # ENI and stays with in current memory setting for this function as well
 # keeps the write capacity units (WRUs) for DynamoDB under 8
-MANYSTAGENUM = int(os.environ['MANYSTAGENUM'])
-EXTRAQUEUESIZE = int(os.environ['EXTRAQUEUESIZE'])
+TICKERQUEUESIZE = int(os.environ['TICKERQUEUESIZE'])
+MAXCONNECTIONS = int(os.environ['MAXCONNECTIONS'])
 
-# initialize DynamoDB Table resources and lambda client
+# Initialize AWS service clients and resources
 table = boto3.resource('dynamodb').Table("OptionsHist")
 ticker_table = boto3.resource('dynamodb').Table("OptionsHistTickers")
 lambdaclient = boto3.client('lambda')
+sqsqueue = boto3.resource('sqs').Queue(os.environ['NOTREACHABLESQS'])
+
+# USED to collect all the unreachable messages to be sent to SQS
+#  for update of the OptionsHistTicker Table
+UNREACHABLEMESSAGES = None
+
+# Stage shutdown globals these should all be wrapped in a class I think
+#  this will work for now give more freedom on picking stage concurrency
+stage1shutdown = None
+stage2shutdown = None
+stage3shutdown = None
+stage4shutdown = None
+stage5shutdown = None
+
+
+def _unreachable_message(ticker, expiration_date, e):
+    """
+    Construct Invocations Unreachable SQS Message
+    """
+    global UNREACHABLEMESSAGES
+    if UNREACHABLEMESSAGES is None:
+        # Debug Error checking
+        raise Exception("UNREACHABLEMESSAGES is None")
+
+    try:
+        UNREACHABLEMESSAGES[ticker].append((expiration_date, str(e)))
+    except KeyError:
+        UNREACHABLEMESSAGES[ticker] = [[expiration_date, str(e)]]
 
 
 def _build_options_url(ticker, date=None):
@@ -101,15 +136,6 @@ def _build_options_url(ticker, date=None):
         url = url + "&date=" + str(int(pd.Timestamp(date).timestamp()))
 
     return url
-
-
-def _logging_exception(ticker, expiration_date, e):
-    """
-    Helper function
-    Used to set consistent cloudwatch log event for log processing
-    """
-
-    print("[{}] [{}] [{}]".format(ticker, expiration_date, str(e)))
 
 
 def _encodeOptionsTable(optstab):
@@ -189,9 +215,14 @@ def _encodeOptionsTable(optstab):
 
     return json.dumps(record)
 
+#######################################################################
+# Main Async functions that implements the stages of the collection
+# pipeline
+
 
 async def ticker_handler(tickers, context, queue_out, HTTPSession):
     """
+    STAGE 1
     Inputs:
         ----------------------------------------------------------------
         tickers --> (list) tickers that still need to be collected
@@ -204,37 +235,90 @@ async def ticker_handler(tickers, context, queue_out, HTTPSession):
 
     Reminders:
         ----------------------------------------------------------------
-        Stage 1: of the async pipline called as a coroutine from
+        STAGE 1: of the async pipline called as a coroutine from
             async_handler. Single instance of this function stages
             (ticker, expiration date) for chain_request(Stage 2).
     """
+    global stage1shutdown
 
-    async def _get_expiration_dates(ticker):
-        """
-        Helper Function
-        Scrapes the expiration dates from each option chain for a given
-        input ticker
+    # Process the tickers and stage them for stage 2
+    while len(tickers) > 0:
 
-        Input:
-            -----------------------------------------------------------
-            ticker --> (String) i.e. "AAPL"
+        if (context.get_remaining_time_in_millis() < 280000 and
+                len(tickers) > 0):
+            # running out of time and there are still tickers
+            #  invoke another lambda function and initiate shutdown of
+            #  the other stages
+            logger.info(
+                "Time remaining: {}, Number of Tickers Left: {}".format(
+                    context.get_remaining_time_in_millis(), len(tickers))
+                )
+            lambdaclient.invoke(
+                FunctionName='OptionsHistory-CollectDataFunc',
+                InvocationType='Event',
+                Payload=json.dumps(
+                    {
+                        'State': 'continue',
+                        'Tickers': tickers,
+                        'run_timestamp': UNREACHABLEMESSAGES['run_timestamp']
+                    }
+                    ).encode()
+                )
 
-        Output:
-            -----------------------------------------------------------
-            (list) of expiration dates for options contracts in format
-                "Month DD, YYYY" i.e. May 15, 2020
+            break
+        elif len(tickers) == 0:
+            break
+        else:
+            ticker = tickers.pop()
+            await queue_out.put(ticker)
+            logger.debug(
+                        "QSIZE STAGE1 -> STAGE2 -- {}".format(
+                            queue_out.qsize()
+                            )
+                        )
 
-        Caveats: Integration
-            -----------------------------------------------------------
-            1.) Should return an empty list if no dates can be located
-            2.) FIX ME, I work but could use some improvments like
-                trying to trick yahoo when out of know where the url
-                can't be found. It works in a browers with a redirect
-                and the proper cookies in the header
-        """
+    # Signal stage 2 that no more values are coming finish up and shutdown
+    stage1shutdown = True
+    await queue_out.put(None)
+    logger.debug("STAGE1 RETURNING")
+    return None
 
+
+async def get_expiration_dates(queue_in, queue_out, HTTPSession):
+    """
+    Stage 2
+    Input:
+        -----------------------------------------------------------
+        ticker --> (String) i.e. "AAPL"
+
+    Output:
+        -----------------------------------------------------------
+        (list) of expiration dates for options contracts in format
+            "Month DD, YYYY" i.e. May 15, 2020
+    """
+    global stage2shutdown
+
+    while True:
+
+        ticker = await queue_in.get()
+        logger.debug(
+                    "QSIZE STAGE1 -> STAGE2 -- {}".format(
+                        queue_in.qsize()
+                        )
+                    )
+        if ticker is None:
+            # Run the concurrent task shutdown process
+            queue_in.task_done()
+            await queue_in.join()
+            if stage2shutdown is False:
+                await queue_out.put((None, None))
+                stage2shutdown = True
+            await queue_in.put(None)
+            logger.debug("STAGE2 RETURNING")
+            return None
+
+        # Get base URL for the ticker
         url = _build_options_url(ticker)
-
         async with HTTPSession.get(url) as response:
             html = await response.text()
 
@@ -243,52 +327,29 @@ async def ticker_handler(tickers, context, queue_out, HTTPSession):
         splits = html.split("</option>")
         dates = [elt[elt.rfind(">"):].strip(">") for elt in splits]
         dates = [elt for elt in dates if elt != '']
-        return dates
 
-    # Process the tickers and stage them for stage 2
-    while len(tickers) > 0:
-        ticker = tickers.pop()
-        expires = await _get_expiration_dates(ticker)
-        if len(expires) == 0:
+        if len(dates) == 0:
             # If no expiration dates can be found log, and continue
-            _logging_exception(
+            _unreachable_message(
                 ticker, "NONE", Exception("No Expiration Dates")
                 )
+            queue_in.task_done()
             continue
+
         else:
-            for expire in expires:
+            for expire in dates:
                 await queue_out.put((ticker, expire))
-
-        if len(tickers) == 0:
-            # Launch the OptionsHistory-LogProcessing
-            lambdaclient.invoke(
-                FunctionName='OptionsHistory-LogProcessing',
-                InvocationType='Event',
-                Payload=json.dumps({}).encode()
-                )
-            break
-        elif context.get_remaining_time_in_millis() < 230000:
-            # running out of time and there are still tickers
-            #  invoke another lambda function and initiate shutdown of
-            #  the other stages
-
-            lambdaclient.invoke(
-                FunctionName='OptionsHistory-CollectDataFunc',
-                InvocationType='Event',
-                Payload=json.dumps(
-                    {'Tickers': tickers, 'State': 'continue'}
-                    ).encode()
-                )
-            break
-
-    # Finished processing all tickers initiate shutdown and return
-    await queue_out.put((None, None))
-    return None
+                logger.debug(
+                    "QSIZE STAGE2 -> STAGE3 -- {}".format(
+                        queue_out.qsize()
+                        )
+                    )
+            queue_in.task_done()
 
 
 async def chain_request(queue_in, queue_out, HTTPSession):
     """
-    Stage 2:
+    STAGE 3
     Inputs:
         ----------------------------------------------------------------
         queue_in --> (asyncio.Queue) Queue between Stage 1 and this
@@ -302,18 +363,27 @@ async def chain_request(queue_in, queue_out, HTTPSession):
             asnyc_handler. Multiple instances of this function run
             simultaneously
     """
+    global stage3shutdown
 
     while True:
         # Block until the next (ticker, expiration_date) is queued
         ticker, expiration_date = await queue_in.get()
-
+        logger.debug(
+                    "QSIZE STAGE2 -> STAGE3 -- {}".format(
+                        queue_in.qsize()
+                        )
+                    )
         if ticker is None:
             # Wait to make sure curcurrent tasks finish before signaling
             #  stage 3 and other concurrent tasks to shutdown
             queue_in.task_done()
             await queue_in.join()
+            if stage3shutdown is False:
+                await queue_out.put((None, None, None))
+                logger.debug("PUT2STAGE4")
+                stage3shutdown = True
             await queue_in.put((None, None))
-            await queue_out.put((None, None, None))
+            logger.debug("STAGE3 RETURNING")
             return None
 
         else:
@@ -331,7 +401,7 @@ async def chain_request(queue_in, queue_out, HTTPSession):
                 try:
                     data['calls'] = tables[0]
                 except IndexError:
-                    _logging_exception(
+                    _unreachable_message(
                         ticker, expiration_date, Exception("No Calls Data")
                         )
                     data['calls'] = None
@@ -339,7 +409,7 @@ async def chain_request(queue_in, queue_out, HTTPSession):
                 try:
                     data['puts'] = tables[1]
                 except IndexError:
-                    _logging_exception(
+                    _unreachable_message(
                         ticker, expiration_date, Exception("No Puts Data")
                         )
                     data['puts'] = None
@@ -347,14 +417,18 @@ async def chain_request(queue_in, queue_out, HTTPSession):
                 if not (data['puts'] is None and data['calls'] is None):
                     # If there is data push to encode_db_item stage
                     await queue_out.put((ticker, expiration_date, data))
+                    logger.debug(
+                        "QSIZE STAGE3 -> STAGE4 -- {}".format(
+                            queue_out.qsize())
+                        )
                 else:
                     # If no data was found log event and move to next item
-                    _logging_exception(
+                    _unreachable_message(
                         ticker, expiration_date, Exception("No Data")
                         )
 
             except Exception as e:
-                _logging_exception(ticker, expiration_date, e)
+                _unreachable_message(ticker, expiration_date, e)
 
             # Signal the queue task is complete for this (ticker, expiration)
             queue_in.task_done()
@@ -362,7 +436,7 @@ async def chain_request(queue_in, queue_out, HTTPSession):
 
 async def encode_db_item(queue_in, queue_out):
     """
-    Stage 3
+    STAGE 4
     Inputs:
         ----------------------------------------------------------------
         queue_in --> (asyncio.Queue) Queue between Stage 2 and this
@@ -370,18 +444,31 @@ async def encode_db_item(queue_in, queue_out):
 
     Reminders:
         ----------------------------------------------------------------
-        Stage 2: of the aync pipeline. Called as coroutine from
-            asnyc_handler. Multiple instances of this function run
-            simultaneously
+        Stage 4: of the aync pipeline. There is really no need for more
+        then one of this task to run. no blocking IO done here and I
+        beleive at the moment the lambda enviroment is a single core
     """
+
+    global stage4shutdown
+
     while True:
         # Block until the next options_chain is available
         ticker, expiration_date, data = await queue_in.get()
-        queue_in.task_done()
+        logger.debug(
+            "QSIZE STAGE3 -> STAGE4 -- {}".format(queue_in.qsize())
+            )
+
         if ticker is None:
             # If (None, None, None) comes through the queue exit function
-            await queue_out.put(None)
+            queue_in.task_done()
+            await queue_in.join()
+            if stage4shutdown is False:
+                await queue_out.put(None)
+                stage4shutdown = True
+            await queue_in.put((None, None, None))
+            logger.debug("STAGE4 RETURNING")
             return None
+
         else:
             item = {}
             # Get current collection time
@@ -398,14 +485,19 @@ async def encode_db_item(queue_in, queue_out):
                 item['calls'] = _encodeOptionsTable(data['calls'])
                 item['puts'] = _encodeOptionsTable(data['puts'])
                 await queue_out.put(item)
+                logger.debug(
+                    "QSIZE STAGE4 -> STAGE5 -- {}".format(queue_out.qsize())
+                    )
             except Exception as e:
                 # if any thing goes wrong with encoding the items
                 #  log the error
-                _logging_exception(ticker, expiration_date, e)
+                _unreachable_message(ticker, expiration_date, e)
+            queue_in.task_done()
 
 
 async def put_db_item(queue_in):
     """
+    STAGE 5
     Async function to put the items into the Dynamdb Table collections
     as many that are current
 
@@ -414,16 +506,16 @@ async def put_db_item(queue_in):
         queue_in --> (asyncio.Queue) Queue between Stage 3 and this
             queue.pop() --> (JSON) item to put to dynamodb
 
-    Reminders:
-        ----------------------------------------------------------------
-        Stage 4 of the processing pipline
     """
-    exittaskflag = False
+
+    global stage5shutdown
+
     while True:
 
-        if exittaskflag is True:
+        if stage5shutdown is True:
             await queue_in.join()
             await queue_in.put(None)
+            logger.debug("STAGE5 RETURNING")
             return None
         else:
             items = []
@@ -432,13 +524,18 @@ async def put_db_item(queue_in):
             # Get All Items that are ready to put to dynamodb
             while True:
                 items.append(queue_in.get_nowait())
+                logger.debug(
+                    "QSIZE STAGE4 -> STAGE5 -- {}".format(queue_in.qsize())
+                    )
         except asyncio.QueueEmpty:
             if len(items) == 0:
                 # Block until an item is available
                 items.append(await queue_in.get())
-
+                logger.debug(
+                    "QSIZE STAGE4 -> STAGE5 -- {}".format(queue_in.qsize())
+                    )
         if items[-1] is None:
-            exittaskflag = True
+            stage5shutdown = True
             # Pop the none off the list of items
             items.pop()
             queue_in.task_done()
@@ -450,7 +547,7 @@ async def put_db_item(queue_in):
                         batch.put_item(Item=item)
                         queue_in.task_done()
             except Exception as e:
-                _logging_exception("DYNAMODB", "NONE", e)
+                _unreachable_message("DYNAMODB", "NONE", e)
 
 
 async def async_handler(tickers, context):
@@ -461,17 +558,24 @@ async def async_handler(tickers, context):
         ----------------------------------------------------------------
         tickers --> list[strings]
         context --> Lambda invokation context object
+    Reminders:
+        ----------------------------------------------------------------
+        Be careful with the max queue sizes the shutdown process has to
+        be accounted for.
+
     """
 
-    # Initialize Queue between a ticker_handler and chain_request
-    th2cr = asyncio.Queue(maxsize=MANYSTAGENUM + EXTRAQUEUESIZE)
+    # Initialize Queue between a ticker_handler and get_expiration_dates
+    th2ge = asyncio.Queue(maxsize=TICKERQUEUESIZE)
+    # Initiailize Queue betweem get_expiration_dates and chain_request
+    ge2cr = asyncio.Queue(maxsize=TICKERQUEUESIZE + MAXCONNECTIONS)
     # Initialize the queue between chain_request and encode_db_item
-    cr2edi = asyncio.Queue(maxsize=MANYSTAGENUM + EXTRAQUEUESIZE)
+    cr2edi = asyncio.Queue(maxsize=TICKERQUEUESIZE + MAXCONNECTIONS)
     # Initiaize Queue between encode_db_item and put_db_item
-    edi2pdi = asyncio.Queue(maxsize=MANYSTAGENUM + EXTRAQUEUESIZE)
+    edi2pdi = asyncio.Queue(maxsize=TICKERQUEUESIZE + MAXCONNECTIONS)
 
     # initalize an aiohttp Client Session and masqurade as a
-    #  firefox client to get needed format for scraping
+    #  firefox client
     HTTPSession = aiohttp.ClientSession(headers={
         "user-agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:75.0)"
         + " Gecko/20100101 Firefox/75.0",
@@ -481,17 +585,20 @@ async def async_handler(tickers, context):
 
     # Create a List of Coroutines to run concurrently as tasks
     # Stage 1: ticker_handler.
-    tasks = [ticker_handler(tickers, context, th2cr, HTTPSession)]
+    tasks = [ticker_handler(tickers, context, th2ge, HTTPSession)]
+
+    for i in range(TICKERQUEUESIZE):
+        tasks.append(get_expiration_dates(th2ge, ge2cr, HTTPSession))
 
     # Stage 2: Many Stage. chain_requests to run concurrently
-    for i in range(MANYSTAGENUM):
-        tasks.append(chain_request(th2cr, cr2edi, HTTPSession))
+    for i in range(MAXCONNECTIONS):
+        tasks.append(chain_request(ge2cr, cr2edi, HTTPSession))
 
     # Stage 3: encode_db_item, No blocking io so single coroutine
     tasks.append(encode_db_item(cr2edi, edi2pdi))
 
     # Stage 4: Many stage. Put items to the DynamoDB as block io
-    for i in range(MANYSTAGENUM):
+    for i in range(2):
         tasks.append(put_db_item(edi2pdi))
 
     # Launch all the coroutines as tasks and wait for them to complete
@@ -505,17 +612,31 @@ async def async_handler(tickers, context):
 def handler(event, context):
     """
     Main handler function for AWS Lambda Invocation
-    See head of file for info a valid input events
+    See head of file for on valid input events
     """
 
-    state = event['State']
+    # Initilaize invocations UNREACHABLE data mapping and
+    #  stage shutdown globals
+    global UNREACHABLEMESSAGES
+    global stage1shutdown, stage2shutdown, stage3shutdown
+    global stage4shutdown, stage5shutdown
+    UNREACHABLEMESSAGES = {"run_timestamp": time.time_ns()}
+    stage1shutdown = False
+    stage2shutdown = False
+    stage3shutdown = False
+    stage4shutdown = False
+    stage5shutdown = False
 
+    state = event['State']
     # Determine what to do based on event state
     if state == "initialize":
         # Logging the initalization of collection process
         #  log processing function needs this log event
         #  so it knows how far back in to process the logs
-        print("--Init Collect Data")
+        logger.info("State: initialize, run_timestamp: {}".format(
+            UNREACHABLEMESSAGES['run_timestamp'])
+            )
+
         tickers = ticker_table.query(
             KeyConditionExpression=Key('Collecting').eq("TRUE"),
             ProjectionExpression='Ticker'
@@ -524,7 +645,7 @@ def handler(event, context):
         if tickers is None:
             # Was unable to get collection list from dynamoDB log error
             #  and return
-            _logging_exception(
+            _unreachable_message(
                 "NONE", "NONE", Exception("""
                     Was Unable to collect tickers from OptionHistTickers
                     DynamoDB Table. Have you added any tickers to the
@@ -534,18 +655,38 @@ def handler(event, context):
         else:
             # construct ticker list from list of return DynamoDB items
             tickers = list(map(lambda x: x.get("Ticker"), tickers))
-            # Initilize the async event loop and launch the aysnc_handler
+            logger.info(
+                "Initialize Number of Tickers: {}".format(len(tickers))
+                )
             asyncio.run(async_handler(tickers, context))
+
     elif state == "continue":
         # Continue Collection with the tickers left in the list
+
         tickers = event['Tickers']
+        UNREACHABLEMESSAGES["run_timestamp"] = event["run_timestamp"]
+        logger.info(
+            "State: continue, Number of remaining tickers: {}".format(
+                len(tickers))
+            )
         # Initilize the async event loop and launch the aysnc_handler
         asyncio.run(async_handler(tickers, context))
 
     else:
         # Invalid state event invoked the function log and return
-        _logging_exception("NONE", "NONE", Exception("""
+        _unreachable_message("NONE", "NONE", Exception("""
             OptionsHistory-CollectDataFunc -- received in invalid event[State]
             """ + str(event['State'])))
+
+    logger.info("Exiting Invocation, Runs total time mins. -- {}".format(
+        1e-9 * (
+            time.time_ns() - UNREACHABLEMESSAGES['run_timestamp']
+            ) / 60.)
+        )
+    # Send the unreachable data to the SQS
+    sqsqueue.send_message(
+            MessageBody=json.dumps(UNREACHABLEMESSAGES)
+        )
+    logger.info("Send sqs message")
 
     return 0

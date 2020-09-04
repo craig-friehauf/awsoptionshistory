@@ -3,14 +3,14 @@
 
 # See REAMME.md of information how these varaibles effect the stack
 STACKNAME='OptionsHistory'
-REGION='us-east-2'
-S3BUCKET='craigfriehauf'
-SNSEMAIL='cfriehauf.contact@gmail.com'
-XRAY='TRUE'
-BUILDDASHBOARD='TRUE'
+REGION='us-west-1'
+S3BUCKET='craigfriehauf-sanfran'
+SNSEMAIL='contact.craigfriehauf@gmail.com'
+#XRAY='TRUE'
+BUILDDASHBOARD='OptionsHistory-Monitoring-Test'
+LOGLEVEL='ERROR'
 # See README.md for more details on AWS formated cron schedules
 CRONSCHEDULE='cron(0 14,17,20 ? * 2-6 *)'
-
 
 _getlambdapackageinfo () {
 	# helper function for managing parameters name and s3keys for lambda
@@ -92,6 +92,7 @@ aws cloudformation deploy --stack-name "${STACKNAME}" \
 	"s3bucket=${S3BUCKET}" "activatexray=${XRAY}" \
 	"cronschedule=${CRONSCHEDULE}" \
 	"builddashboard=${BUILDDASHBOARD}" \
+	"loglevellambdafunctions=${LOGLEVEL}" \
 	--region "${REGION}"
 
 if [[  $? -eq 255  ]]; then

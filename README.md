@@ -44,13 +44,16 @@ STACKNAME, REGION, S3BUCKET need to be set to same values found in deploy-stack.
 	> REQUIRED a S3 bucket in the region REGION, all code artifacts will be uploaded to the bucket with prefix "/OptionsHistory"
 
 * #### SNSEMAIL='bleh@gmail.com' 
-	> An e-mail address to send Error Reports about collections Error. Comment out or set to the empty string to disable. See [Caveats](#Caveats) below for more information
+	> An e-mail address to send unreachable data reports to. Comment out or set to the empty string to disable. If an e-mail is given [unreachable endpoint](#UNREACHABLE) will build and e-mail a report on what data was not found on last collection run.
 
 * #### XRAY='TRUE' 
 	> Any none empty string will enable X-Ray tracing for the application and services. Comment out or set to empty string to disable.
 
-* #### BUILDDASHBOARD='TRUE' 
-	> Any none empty string will build a CloudWatch Dashboard for application monitoring.   
+* #### BUILDDASHBOARD='DashBoardName' 
+	> Any none empty string will build a CloudWatch Dashboard for application monitoring. With name given to the variable   
+
+* #### LOGLEVEL='DEBUG|INFO|WARNING|ERROR|CRITICAL'   
+	> Python log level for lambda functions, defaults to ERROR if empty string   
 
 * #### CRONSCHEDULE='cron(0 14,17,20 ? \* 2-6 \*)' 
 	> Creates a Scheduled EventBridge Rule that initializes the collection process for companies/tickers that are currently in the collection list. See [AWS EventBridge Docs](https://docs.aws.amazon.com/eventbridge/latest/userguide/scheduled-events.html) for information on setting a different schedule. If the variable is set to the empty string the Rule will not be created. Options pricing data collection can be launch manual by "POST /collect" see [API Resource](#Endpoints) below.
@@ -63,7 +66,7 @@ STACKNAME, REGION, S3BUCKET need to be set to same values found in deploy-stack.
 <a name=DATAINTERVALS></a>   
 
 * ##### GET /tickers
-	> ```JSON [   
+	> ``` [   
 				{   
 					"Ticker": 'AAPL',    
 					"Collecting": 'TRUE|UUID',    
@@ -71,7 +74,7 @@ STACKNAME, REGION, S3BUCKET need to be set to same values found in deploy-stack.
 					"Ending": "YYYY-MM-DD"   
 				},    
 					...   
-			] ```      
+		  ] ```      
 	> JSON List where each item is a JSON Object.    
 	>"Ticker" is the trading ticker of a company, each item represents a closed or open interval of data that has been collected and stored.   
 	>"Collecting" is "TRUE" if current collection runs are collecting data for the ticker/company. If it is a unique identifier its a interval of data that was collected for the ticker/company and was later removed from the collect list. A company/ticker can end up with multiple intervals of data if collection gets turned on and off.    
@@ -88,12 +91,17 @@ STACKNAME, REGION, S3BUCKET need to be set to same values found in deploy-stack.
 	> Will launch a collection run collecting options pricing information for all tickers/companies found in collection list.
 
 * ##### GET /data?Ticker=AAPL&day=YYYY-MM-DD 
-	> Get a JSON object that can be read by pandas.read_json() to produce a Pandas DataFrame of the all pricing data collected on the given ticker on the given day. The api is a little limited but given the size of the storage items this seems to be an efficent way of getting the data out (Design goal #1 try to keep it in Perpetually Free Tier). See [encoded requests](#GETENCODED) request below to minimize network traffic out of AWS. Returns '[]' if not data is found for the company.
+	> Get a JSON object that can be read by pandas.read_json() to produce a Pandas DataFrame of the all pricing data collected on the given ticker on the given day. The api is a little limited but given the size of the storage items this seems to be an efficent way of getting the data out (Design goal #1 try to keep it in Perpetually Free Tier). See [encoded requests](#GETENCODED) below to minimize network traffic out of AWS. Returns '[]' if not data is found for the company.   
 
 <a name=GETENCODED></a>   
 
 * ##### GET /data/encoded?Ticker=AAPL&day=YYYY-MM-DD
  	> Get a JSON object that holds all information in a reduced format where the table is stored in a base64 encoded byte string. See clientexample/clientexample.py for some python code that will construct a pandas.DataFrame from the response.
+
+<a name=UNREACHABLE></a>
+
+* ##### GET /unreachable   
+	> e-mail report on data that was not found on last collect run. SNSEMAIL must be set 
 
 * ##### POST /purge?uuid=uuid|Ticker=AAPL
 	> This is the only endpoint that will fully delete data that has been collected. A valid uuid parameter will delete the data in a given interval. A Ticker parameter will delete all data associated with the company/ticker
@@ -103,7 +111,7 @@ STACKNAME, REGION, S3BUCKET need to be set to same values found in deploy-stack.
 
 ### Caveats/Needs Improvement   
 
-> The WebScraping Code as of now is pretty trivial. Making simple GET requests and getting the data out that it can (Scraping from finance.yahoo.com). Yahoo seems to have some things set up to make sure you view the ads. At what would seem to be random times, and random companies the GET requests return a company not found page inconsistently (a hour from now the companies that are not reachable through simple GET requests change, after market hours seems to work more consistently). In a browser there is some redirection and cookies being used that allows the browser to locate the data at a different domain. I have yet to get this figured out, in a python script (Its seems cumbersome for the reward). With that said I estimate in any given collection run it is currently collecting 80% of the data, which still is quite a bit information. There is also currently a synchronization issue with the logprocessingfunc. This function scans the CloudWatch logs and publishes an error report to SNS about what data was unable to be reached. CloudWatch LogEvents can come in to slow so the error report does not catch all current collection runs data unreachable events. The more companies/tickers that you are collecting data for the less of a problem this is but its still a problem. REMINDER need to build this with SQS so it can be driven by the event unreachable not the event collectdatafunc done running.  
+> The WebScraping Code as of now is pretty trivial. Making simple GET requests and getting the data out that it can (Scraping from finance.yahoo.com). Yahoo seems to have some things set up to make sure you view the ads. At what would seem to be random times, and random companies the GET requests return a company not found page inconsistently (a hour from now the companies that are not reachable through simple GET requests change, after market hours seems to work more consistently). In a browser there is some redirection and cookies being used that allows the browser to locate the data at a different domain. I have yet to get this figured out, in a python script (Its seems cumbersome for the reward). With that said I estimate in any given collection run it is currently collecting 80% of the data, which still is quite a bit information.
 
 ### Example X-Ray Service Map   
 

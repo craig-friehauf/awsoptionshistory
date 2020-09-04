@@ -10,6 +10,8 @@ OptionsHist table.
 import os
 import boto3
 from datetime import datetime
+import logging
+
 
 if not os.environ.get("XRAYACTIVATED") is None:
     # Xray Has been activated for the stack, patch calls to AWS services
@@ -18,6 +20,10 @@ if not os.environ.get("XRAYACTIVATED") is None:
     from aws_xray_sdk.core import patch_all
     # Patch for X-Ray Tracing to DynamoDB API Calls
     patch_all()
+
+# Set up logging module and set LOGELEVEL
+logger = logging.getLogger()
+logger.setLevel(getattr(logging, os.environ['LOGLEVEL']))
 
 # Initialize the DynamoDB OptionsHistTickers Table resource
 ticker_table = boto3.resource('dynamodb').Table('OptionsHistTickers')
@@ -75,6 +81,10 @@ def handler(event, context):
         if item is None:
             # Check if ticker has been removed from the collect list
             #  between collect and processing of the stream
+            logger.info(
+                "{} with collection TRUE was not found in".format(ticker)
+                + "OptionsHistTicker Table"
+                )
             continue
 
         day = datetime.strptime(day, '%Y%m%d').isoformat()[:10]
@@ -82,6 +92,7 @@ def handler(event, context):
         if item.get('Starting') is None:
             # Starting attribute in None set initial Starting and
             #  Ending Attributes
+            logger.info("Setting starting time for -- {}".format(ticker))
             ticker_table.update_item(
                 Key={'Ticker': ticker, 'Collecting': 'TRUE'},
                 UpdateExpression='SET Starting = :start, Ending = :end',

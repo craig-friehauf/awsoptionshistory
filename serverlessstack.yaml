@@ -1,4 +1,4 @@
-AWSTemplateFormatVersion: 2010-09-09 #Currently only valid value 
+AWSTemplateFormatVersion: "2010-09-09" #Currently only valid value 
 Description: Stack for OptionsHistory collection and Simple API
  
 Parameters: 
@@ -60,6 +60,17 @@ Parameters:
     Type: String
     Default: ""
 
+  # Log level
+  loglevellambdafunctions:
+    Type: String
+    Default: ERROR
+    AllowedValues:
+      - CRITICAL
+      - ERROR
+      - WARNING
+      - INFO
+      - DEBUG  
+
 Conditions:
   PublishErrorsSNSCondition: !Not [ !Equals [!Ref logprocessingsnssubscriber, "" ] ]
   ActivateXRayCondition: !Not [ !Equals [ !Ref activatexray, "" ] ]
@@ -91,7 +102,7 @@ Resources:
       # Policy once role is assumed is added through LambdaPolicy
       Description: "Common role for Lambda Functions in OptionsHistory Stack"
       AssumeRolePolicyDocument:
-        Version: 2012-10-17
+        Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Principal:
@@ -102,7 +113,7 @@ Resources:
       Policies:
         - PolicyName: OptionsHistory-LambdaRolePolicy
           PolicyDocument:
-            Version: 2012-10-17
+            Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action:
@@ -115,6 +126,11 @@ Resources:
                   - logs:PutLogEvents           
                   - logs:GetLogEvents
                   - logs:DescribeLogStreams
+                  - sqs:DeleteMessage
+                  - sqs:ReceiveMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:SendMessage
+                  - sqs:SendMessageBatch
                   - lambda:InvokeFunction
                   - xray:PutTraceSegments
                 Resource: "*"
@@ -170,6 +186,7 @@ Resources:
             - ActivateXRayCondition
             - "TRUE"
             - !Ref AWS::NoValue
+          LOGLEVEL: !Ref loglevellambdafunctions
       Layers: 
         - !Ref CollectDataLayer
         - !If
@@ -244,8 +261,7 @@ Resources:
             - ActivateXRayCondition
             - "TRUE"
             - !Ref AWS::NoValue
-          COLLECTIONLOGGROUP: !Ref CollectDataFunctionLogs
-
+          LOGLEVEL: !Ref loglevellambdafunctions
       TracingConfig:
         Mode: !If
           - ActivateXRayCondition
@@ -270,7 +286,7 @@ Resources:
       FunctionName: !GetAtt LogProcessingFunction.Arn
       Action: 'lambda:InvokeFunction'
       Principal: 'lambda.amazonaws.com'
-      SourceArn: !GetAtt CollectDataFunction.Arn
+      SourceArn: !GetAtt LambdaProxyFunction.Arn
 
   # SNS topic for publishing error reports
   LogProcessingSNSTopic:
@@ -285,8 +301,45 @@ Resources:
       TopicName: ScrapingErrorNotification
 
   ######################################################################
+  # SQS Queue for monitoring scaping unreachable companies/tickers
+  #  Event Source Mapping. Setting up the Queue Messages to be deleived
+  #  the log processing function
+  NotReachableQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 3600
+      VisibilityTimeout: 360
+ 
+  NotReachableQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt LambdaRole.Arn
+            Action:
+              - sqs:DeleteMessage
+              - sqs:ReceiveMessage
+              - sqs:GetQueueAttributes
+              - sqs:SendMessage
+            Resource: !GetAtt NotReachableQueue.Arn
+      Queues: 
+        - !Ref NotReachableQueue
+
+  NotReachableEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt NotReachableQueue.Arn
+      FunctionName: !GetAtt LogProcessingFunction.Arn
+
+  ######################################################################
   # Collect Data Lambda Function Resources
-  # Function that runs the parser for Data collection function
+  # Function that runs the parser for Data collection fuQueueQueueQueueQueuenction
   CollectDataFunction:
     Type: AWS::Lambda::Function
     DeletionPolicy: Delete
@@ -304,8 +357,10 @@ Resources:
             - ActivateXRayCondition
             - "TRUE"
             - !Ref AWS::NoValue
-          MANYSTAGENUM: 32
-          EXTRAQUEUESIZE: 20
+          TICKERQUEUESIZE: 5
+          MAXCONNECTIONS: 32
+          NOTREACHABLESQS: !Ref NotReachableQueue
+          LOGLEVEL: !Ref loglevellambdafunctions
       Layers: 
         - !Ref CollectDataLayer
         - !If 
@@ -323,9 +378,18 @@ Resources:
   CollectDataFunctionLogs:
     Type: AWS::Logs::LogGroup
     DeletionPolicy: Delete
+    DependsOn: CollectDataFunction
     Properties:
       LogGroupName: !Join [ "", [ /aws/lambda/ , !Ref CollectDataFunction ] ]
       RetentionInDays: 7
+
+  CollectDataFunctionInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    DependsOn: CollectDataFunction
+    Properties:
+      FunctionName: !Ref collectdatafuncname
+      MaximumRetryAttempts: 0
+      Qualifier: '$LATEST'
 
   CollectDataRecursivePermission:
     Type: AWS::Lambda::Permission
@@ -397,6 +461,7 @@ Resources:
             - ActivateXRayCondition
             - "TRUE"
             - !Ref AWS::NoValue
+          LOGLEVEL: !Ref loglevellambdafunctions
       Layers:
         - !If 
           - ActivateXRayCondition
@@ -506,7 +571,7 @@ Resources:
       Type: AWS::CloudWatch::Dashboard
       Condition: BuildDashBoardCondition
       Properties:
-        DashboardName: "OptionsHistory-Monitoring"
+        DashboardName: !Ref builddashboard
         DashboardBody: !Sub 
           - >
             { "widgets" : 
@@ -535,6 +600,7 @@ Resources:
                       "region": "${__regionplaceholder}",
                       "stat": "Sum",
                       "title": "Data Collection Invocations",
+                      "period": 1800,
                       "view": "singleValue",
                       "metrics": [
                           [
@@ -558,6 +624,7 @@ Resources:
                       "region": "${__regionplaceholder}",
                       "stat": "Sum",
                       "title": "API Requests",
+                      "period": 1800,
                       "view": "singleValue",
                       "metrics" : [
                         [
@@ -574,12 +641,13 @@ Resources:
                   "type": "metric",
                   "x": 0,
                   "y": 2,
-                  "width": 5,
+                  "width": 6,
                   "height": 2,
                   "properties":
                     {
                       "region": "${__regionplaceholder}",
                       "stat": "Sum",
+                      "period": 1800,
                       "title": "Lambda Proxy Function Errors",
                       "view": "singleValue",
                       "metrics" : [
@@ -595,14 +663,15 @@ Resources:
 
                 {
                   "type": "metric",
-                  "x": 5,
+                  "x": 6,
                   "y": 2,
-                  "width": 5,
+                  "width": 6,
                   "height": 2,
                   "properties":
                     {
                       "region": "${__regionplaceholder}",
                       "stat": "Sum",
+                      "period": 1800,
                       "title": "Data Collection Function Errors",
                       "view": "singleValue",
                       "metrics" : [
@@ -618,14 +687,15 @@ Resources:
                 
                 {
                   "type": "metric",
-                  "x": 10,
+                  "x": 12,
                   "y": 2,
-                  "width": 5,
+                  "width": 6,
                   "height": 2,
                   "properties":
                     {
                       "region": "${__regionplaceholder}",
                       "stat": "Sum",
+                      "period": 1800,
                       "title": "Log Processing Function Errors",
                       "view": "singleValue",
                       "metrics" : [
@@ -641,14 +711,15 @@ Resources:
 
                 {
                   "type": "metric",
-                  "x": 15,
+                  "x": 18,
                   "y": 2,
-                  "width": 5,
+                  "width": 6,
                   "height": 2,
                   "properties":
                     {
                       "region": "${__regionplaceholder}",
                       "stat": "Sum",
+                      "period": 1800,
                       "title": "DBStream Processing Function Errors",
                       "view": "singleValue",
                       "metrics" : [
@@ -747,7 +818,7 @@ Resources:
                   "type": "log",
                   "x": 0,
                   "y": 12,
-                  "width": 5,
+                  "width": 6,
                   "height": 4,
                   "properties":
                     {
@@ -760,9 +831,9 @@ Resources:
                 },
                 {
                   "type": "log",
-                  "x": 5,
+                  "x": 6,
                   "y": 12,
-                  "width": 5,
+                  "width": 6,
                   "height": 4,
                   "properties":
                     {
@@ -775,9 +846,9 @@ Resources:
                 },
                 {
                   "type": "log",
-                  "x": 10,
+                  "x": 12,
                   "y": 12,
-                  "width": 5,
+                  "width": 6,
                   "height": 4,
                   "properties":
                     {
@@ -790,9 +861,9 @@ Resources:
                 },
                 {
                   "type": "log",
-                  "x": 15,
+                  "x": 18,
                   "y": 12,
-                  "width": 5,
+                  "width": 6,
                   "height": 4,
                   "properties":
                     {
@@ -806,82 +877,16 @@ Resources:
 
                 {
                   "type": "log",
-                  "x": 0,
+                  "x": 6,
                   "y": 16,
-                  "width": 5,
-                  "height": 4,
+                  "width": 12,
+                  "height": 6,
                   "properties":
                     {
                       "region": "${__regionplaceholder}",
                       "title": "Lambda Proxy Function Request Counts",
                       "view": "bar",
                       "query": "SOURCE '${__lambdaproxyfunctionlogplaceholder}' | fields @message | parse '* [*] *' as logtype, requesttype, remainder | filter logtype = 'REQUEST' | stats count(*) by requesttype"
-                    }
-                },
-
-                {
-                  "type": "metric",
-                  "x": 5,
-                  "y": 16,
-                  "width": 5,
-                  "height": 4,
-                  "properties":
-                    {
-                      "region": "${__regionplaceholder}",
-                      "title": "Data Collection Function Duration",
-                      "view": "bar",
-                      "metrics" : [
-                        [
-                          "AWS/Lambda",
-                          "Duration",
-                          "FunctionName",
-                          "${__collectionfunctionameplaceholder}"
-                        ]
-                      ]
-                    }
-                },
-                
-                {
-                  "type": "metric",
-                  "x": 10,
-                  "y": 16,
-                  "width": 5,
-                  "height": 4,
-                  "properties":
-                    {
-                      "region": "${__regionplaceholder}",
-                      "title": "Log Processing Duration",
-                      "view": "bar",
-                      "metrics" : [
-                        [
-                          "AWS/Lambda",
-                          "Duration",
-                          "FunctionName",
-                          "${__logprocessingfunctionnameplaceholder}"
-                        ]
-                      ]
-                    }
-                },
-
-                {
-                  "type": "metric",
-                  "x": 15,
-                  "y": 16,
-                  "width": 5,
-                  "height": 4,
-                  "properties":
-                    {
-                      "region": "${__regionplaceholder}",
-                      "title": "DBStream Processing Duration",
-                      "view": "bar",
-                      "metrics" : [
-                        [
-                          "AWS/Lambda",
-                          "Duration",
-                          "FunctionName",
-                          "${__streamprocessingfunctionnameplaceholder}"
-                        ]
-                      ]
                     }
                 }
               ]

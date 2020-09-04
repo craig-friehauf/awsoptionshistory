@@ -21,6 +21,8 @@ GET /tickers --> JSON({"Tickers": [...]}) get the current tickers
     that collection runs are currently scraping data for as well as
     collected intervals
 
+GET /unreachable --> HTML Document for an unreachable data report
+
 POST /tickers?Ticker=AAPL --> Add a companies ticker that will be collected
     on each collection run
 
@@ -56,6 +58,7 @@ from datetime import datetime
 from decimal import Decimal
 import re
 import uuid
+import logging
 
 if not os.environ.get("XRAYACTIVATED") is None:
     # Xray Has been activated for the stack, patch calls to AWS services
@@ -64,6 +67,10 @@ if not os.environ.get("XRAYACTIVATED") is None:
     from aws_xray_sdk.core import patch_all
     # Patch for X-Ray Tracing with DynamoDB
     patch_all()
+
+# Set up logging
+logger = logging.getLogger()
+logger.setLevel(getattr(logging, os.environ['LOGLEVEL']))
 
 
 def _decodeOptionsTable(record):
@@ -168,7 +175,8 @@ class WSGIApp(object):
             Rule("/tickers", methods=['POST'], endpoint='addticker'),
             Rule("/tickers",  methods=['GET'], endpoint='getticker'),
             Rule("/tickers", methods=['DELETE'], endpoint='rmticker'),
-            Rule("/collect", methods=['POST'], endpoint='initializecollection')
+            Rule("/collect", methods=['POST'], endpoint='initcollection'),
+            Rule("/unreachable", methods=['GET'], endpoint='unreachable')
             ])
 
     def _request_logging(self, endpoint, ip_address, info):
@@ -420,7 +428,7 @@ class WSGIApp(object):
             )
         return response(environ, start_response)
 
-    def initializecollection(self, environ, start_response):
+    def initcollection(self, environ, start_response):
         """
         POST /collect
 
@@ -435,11 +443,45 @@ class WSGIApp(object):
                     {'State': 'initialize'}
                     ).encode()
                 )
+
+        self._request_logging(
+            'initcollection',
+            str(environ.get('awsgi.requester')),
+            ""
+            )
+
         return Response(
             "Collection Run initialized {}\n".format(
                 datetime.now().isoformat()
                 )
             )(environ, start_response)
+
+    def unreachable(self, environ, start_response):
+        """
+        GET /unreachable
+
+        Returns unreachable report in html
+        """
+
+        response = lambdaclient.invoke(
+            FunctionName='OptionsHistory-LogProcessing',
+            InvocationType='RequestResponse',
+            Payload=json.dumps(
+                {'Report': 'flagged'}
+                ).encode()
+            )
+        html = response.get('Payload')
+        if html is None:
+            logger.debug("No Payload was returned from Logprocessing")
+
+        html = json.loads(html.read().decode()).get('html')
+        self._request_logging(
+            'unreachable',
+            str(environ.get('awsgi.requester')),
+            ""
+            )
+        logger.info("HTML RETURNED -- {}".format(html))
+        return Response(html)(environ, start_response)
 
     def __call__(self, environ, start_response):
         # Bind the environment to the url rule map
