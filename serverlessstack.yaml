@@ -358,7 +358,7 @@ Resources:
             - "TRUE"
             - !Ref AWS::NoValue
           TICKERQUEUESIZE: 5
-          MAXCONNECTIONS: 18
+          MAXCONNECTIONS: 12
           NOTREACHABLESQS: !Ref NotReachableQueue
           LOGLEVEL: !Ref loglevellambdafunctions
       Layers: 
@@ -372,7 +372,7 @@ Resources:
           - ActivateXRayCondition
           - Active
           - !Ref AWS::NoValue
-      MemorySize: 448
+      MemorySize: 384
       Timeout: 300
   
   CollectDataFunctionLogs:

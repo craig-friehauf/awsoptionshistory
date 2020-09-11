@@ -19,10 +19,12 @@ else:
 with open("APIEndpoint", 'r') as fp:
     endpoint = fp.read()
 
+day = datetime.utcnow().isoformat()[:10]
+day = '2020-09-03'
 # Using the Data Enpoint
 response = requests.get(endpoint[:-1] + "/data", params={
     "Ticker": EXAMPLETICKER,
-    "day": datetime.utcnow().isoformat()[:10]})
+    "day": day})
 
 print("Total Response Bytes /data -- " + str(len(response.text.encode())))
 
@@ -44,7 +46,7 @@ print("\n\n")
 response = requests.get(
     endpoint[:-1] + "/data/encoded",
     params={"Ticker": EXAMPLETICKER,
-            "day": datetime.utcnow().isoformat()[:10]})
+            "day": day})
 
 ########################################################################
 # Function that will decode the encoded response to the same data frame
@@ -140,7 +142,10 @@ def decodeResponse(responseString):
 
     items = json.loads(responseString).get("Items")
     items = list(map(_decodeItem, items))
-    return pd.concat(items)
+    if len(items) > 0:
+        return pd.concat(items)
+    else:
+        return pd.DataFrame()
 
 
 print("Total Respose Bytes /data/encoded endpoint -- "

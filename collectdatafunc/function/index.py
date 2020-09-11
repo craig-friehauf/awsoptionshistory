@@ -244,7 +244,7 @@ async def ticker_handler(tickers, context, queue_out, HTTPSession):
     # Process the tickers and stage them for stage 2
     while len(tickers) > 0:
 
-        if (context.get_remaining_time_in_millis() < 280000 and
+        if (context.get_remaining_time_in_millis() < 260000 and
                 len(tickers) > 0):
             # running out of time and there are still tickers
             #  invoke another lambda function and initiate shutdown of
